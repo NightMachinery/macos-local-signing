@@ -1,0 +1,263 @@
+#!/bin/zsh -f
+# macos-local-signing: a self-signed code signing identity for apps you build
+# and run on your own Mac, kept as a file instead of in the login keychain.
+#
+# Why sign at all: an ad-hoc signature pins macOS privacy grants (Microphone,
+# Accessibility, Full Disk Access...) to the hash of one exact build, so every
+# rebuild asks again. Signed with a certificate, the grant follows the bundle
+# id and the certificate instead, and survives rebuilds.
+#
+# Why a file: with the private key in the login keychain, macOS asks for your
+# password each time codesign uses it, once per signed file, which is dozens
+# for an Electron or Tauri app, and an unattended build cannot answer at all.
+# Here each signing run imports the key into a throwaway keychain whose
+# password it knows, so nothing ever prompts.
+#
+# What it does not do: Gatekeeper and System Settings still call the app
+# "unidentified developer". Only an Apple-issued Developer ID changes that.
+#
+# usage:
+#   macos-local-signing ensure NAME        create (or finish) the identity; trusting
+#                                          it shows one password dialog, so run it
+#                                          at the Mac's screen, not over ssh
+#   macos-local-signing import NAME        move an identity of that name from the
+#                                          login keychain into the file store (keeps
+#                                          the certificate, so existing grants stay)
+#   macos-local-signing ready NAME         exit 0 if the identity is usable
+#   macos-local-signing dir NAME           its directory: identity.p12, password, cert.pem
+#   macos-local-signing env NAME FORMAT    shell exports for a build tool, FORMAT is
+#                                          electron-builder or tauri; use with eval
+#   macos-local-signing codesign NAME ARG...
+#                                          run codesign --sign NAME ARG... from a
+#                                          throwaway keychain
+#
+# The store is $MACOS_LOCAL_SIGNING_HOME (default ~/.local/state/macos-local-signing),
+# one directory per identity, readable only by you.
+emulate -L zsh
+setopt err_exit no_unset pipe_fail extended_glob
+# Only macOS's own tools: a GNU or other base64, awk or openssl earlier on the
+# caller's PATH takes different options or writes formats `security` rejects.
+path=(/usr/bin /bin /usr/sbin /sbin)
+
+store=${MACOS_LOCAL_SIGNING_HOME:-$HOME/.local/state/macos-local-signing}
+login=$HOME/Library/Keychains/login.keychain-db
+# The system LibreSSL: a Homebrew OpenSSL 3 writes PKCS#12 with a MAC that
+# `security import` rejects as a wrong password.
+ssl=/usr/bin/openssl
+security=/usr/bin/security
+me=${0:t}
+
+die() { print -ru2 -- "$me: $*"; exit 1 }
+say() { print -ru2 -- "$me: $*" }
+
+# The directory name: the identity's name, lowercased, with runs of anything
+# but letters and digits turned into one dash.
+slug() {
+  local s=${(L)1}
+  s=${s//[^a-z0-9]##/-}
+  print -r -- ${${s#-}%-}
+}
+
+id_dir() { print -r -- $store/$(slug $1) }
+
+trusted() {
+  [[ -s $1/cert.pem ]] && $security verify-cert -q -c $1/cert.pem -p codeSign >/dev/null 2>&1
+}
+
+complete() {
+  [[ -s $1/identity.p12 && -s $1/password && -s $1/cert.pem ]]
+}
+
+ready() {
+  local d=$(id_dir $1)
+  complete $d && trusted $d
+}
+
+trust() {
+  local name=$1 d=$(id_dir $1)
+  trusted $d && return 0
+  say "trusting '$name' for code signing; macOS asks for your login password once"
+  # User trust settings, limited to code signing; adds the certificate (not
+  # the key) to the login keychain. Needs someone at the screen.
+  $security add-trusted-cert -r trustRoot -p codeSign -k $login $d/cert.pem ||
+    die "could not trust '$name'. This needs the Mac's screen; over ssh macOS refuses."
+  trusted $d || die "'$name' is still not trusted for code signing"
+}
+
+cmd_ensure() {
+  local name=$1 d=$(id_dir $1)
+  if ! complete $d; then
+    if $security find-certificate -c $name $login >/dev/null 2>&1 &&
+       [[ -n $(login_identity_hash $name) ]]; then
+      say "'$name' is in the login keychain; importing it instead of making a new one"
+      cmd_import $name
+    else
+      create $name
+    fi
+  fi
+  trust $name
+  print -r -- $d
+}
+
+create() {
+  local name=$1 d=$(id_dir $1) work
+  say "creating '$name' in $d"
+  umask 077
+  mkdir -p $d
+  work=$(mktemp -d -t macos-local-signing)
+  {
+    print -r -- "[req]
+distinguished_name = dn
+x509_extensions = ext
+prompt = no
+[dn]
+CN = $name
+[ext]
+basicConstraints = critical,CA:false
+keyUsage = critical,digitalSignature
+extendedKeyUsage = critical,codeSigning" > $work/openssl.cnf
+    $ssl req -x509 -newkey rsa:2048 -nodes -days 3650 -config $work/openssl.cnf \
+      -keyout $work/key.pem -out $work/cert.pem 2>/dev/null
+    $ssl rand -hex 16 > $d/password
+    $ssl pkcs12 -export -name $name -out $d/identity.p12 \
+      -inkey $work/key.pem -in $work/cert.pem -passout file:$d/password
+    cp $work/cert.pem $d/cert.pem
+  } always {
+    rm -rf $work
+  }
+}
+
+login_identity_hash() {
+  $security find-identity -p codesigning $login 2>/dev/null |
+    awk -v n="\"$1\"" 'index($0, n) && $2 ~ /^[0-9A-F]+$/ { print $2; exit }'
+}
+
+cmd_import() {
+  local name=$1 d=$(id_dir $1) work hash pass
+  complete $d && die "'$name' is already in $d"
+  hash=$(login_identity_hash $name)
+  [[ -n $hash ]] || die "no identity named '$name' in the login keychain"
+  umask 077
+  mkdir -p $d
+  work=$(mktemp -d -t macos-local-signing)
+  {
+    pass=$($ssl rand -hex 16)
+    # `security export` cannot pick one identity, so export them all into the
+    # private temporary directory and keep only ours. macOS may ask once per
+    # key to allow the export.
+    say "exporting from the login keychain; macOS may ask to allow it"
+    $security export -k $login -t identities -f pkcs12 -P $pass -o $work/all.p12 \
+      >/dev/null 2>$work/export.err || { cat $work/export.err >&2; die "export failed" }
+    $ssl pkcs12 -in $work/all.p12 -passin pass:$pass -nodes -out $work/all.pem 2>/dev/null
+    # Pair the certificate whose subject is CN=name with the key that has the
+    # same localKeyID.
+    awk -v cn=$name -v out=$work '
+      /localKeyID:/ { sub(/^[^:]*: */, ""); kid = $0 }
+      /^subject=/ { subject = $0 }
+      /^-----BEGIN CERTIFICATE-----/ { incert = 1; buf = "" }
+      /^-----BEGIN (RSA |EC )?PRIVATE KEY-----/ { inkey = 1; buf = "" }
+      incert || inkey { buf = buf $0 "\n" }
+      /^-----END CERTIFICATE-----/ {
+        incert = 0
+        if (subject ~ ("CN ?= ?" cn "(,|/|$)")) { cert = buf; want = kid }
+      }
+      /^-----END (RSA |EC )?PRIVATE KEY-----/ { inkey = 0; keys[kid] = buf }
+      END {
+        if (cert == "" || !(want in keys)) exit 1
+        printf "%s", cert > (out "/cert.pem")
+        printf "%s", keys[want] > (out "/key.pem")
+      }' $work/all.pem || die "could not find '$name' with its key in the export"
+    $ssl rand -hex 16 > $d/password
+    $ssl pkcs12 -export -name $name -out $d/identity.p12 \
+      -inkey $work/key.pem -in $work/cert.pem -passout file:$d/password
+    cp $work/cert.pem $d/cert.pem
+  } always {
+    rm -rf $work
+  }
+  # Remove it from the login keychain, so nothing signs from there any more.
+  # The certificate goes with it; `trust` puts the certificate back, key-less.
+  $security delete-identity -Z $hash $login >/dev/null ||
+    say "warning: could not remove '$name' from the login keychain"
+  say "imported '$name' into $d"
+}
+
+cmd_dir() {
+  ready $1 || die "'$1' is not ready; run: $me ensure '$1'"
+  id_dir $1
+}
+
+cmd_env() {
+  local name=$1 format=$2 d
+  d=$(cmd_dir $name)
+  case $format in
+    electron-builder)
+      print -r -- "export CSC_LINK=${(q)d}/identity.p12"
+      print -r -- "export CSC_KEY_PASSWORD=$(<$d/password)"
+      print -r -- "export CSC_NAME=${(q)name}"
+      ;;
+    tauri)
+      print -r -- "export APPLE_CERTIFICATE=$(base64 -i $d/identity.p12 | tr -d '\n')"
+      print -r -- "export APPLE_CERTIFICATE_PASSWORD=$(<$d/password)"
+      print -r -- "export APPLE_SIGNING_IDENTITY=${(q)name}"
+      ;;
+    *) die "unknown format '$format'; use electron-builder or tauri" ;;
+  esac
+}
+
+# The user's keychain search list, one path per element.
+search_list() {
+  $security list-keychains -d user | sed -e 's/^[[:space:]]*"//' -e 's/"[[:space:]]*$//'
+}
+
+search_list_add() {
+  $security list-keychains -d user -s "${(@f)$(search_list)}" $1
+}
+
+# Remove only our entry, re-reading the list rather than restoring a snapshot,
+# so a keychain another build added meanwhile stays.
+search_list_remove() {
+  local -a keep=("${(@f)$(search_list)}")
+  keep=(${keep:#$1})
+  $security list-keychains -d user -s "${keep[@]}" 2>/dev/null || true
+}
+
+cmd_codesign() {
+  local name=$1 d work kc kpw
+  shift
+  d=$(cmd_dir $name)
+  # Resolved (/var is a symlink to /private/var), to match the search list.
+  work=${$(mktemp -d -t macos-local-signing):A}
+  kc=$work/sign.keychain-db
+  {
+    kpw=$($ssl rand -hex 16)
+    $security create-keychain -p $kpw $kc
+    $security set-keychain-settings $kc  # no auto-lock mid-run
+    $security unlock-keychain -p $kpw $kc
+    $security import $d/identity.p12 -k $kc -P "$(<$d/password)" -T /usr/bin/codesign >/dev/null
+    # Lets codesign use the key without asking; needs the keychain password,
+    # which only this run knows.
+    $security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k $kpw $kc >/dev/null
+    # codesign finds identities only in keychains on the search list, even
+    # with --keychain, so add ours for the duration of the run.
+    search_list_add $kc
+    /usr/bin/codesign --keychain $kc --sign $name "$@"
+  } always {
+    search_list_remove $kc
+    $security delete-keychain $kc 2>/dev/null || true
+    rm -rf $work
+  }
+}
+
+(( $# >= 2 )) || die "usage: $me ensure|import|ready|dir|env|codesign NAME [ARG...]"
+sub=$1 name=$2
+shift 2
+[[ -n $name ]] || die "the identity name is empty"
+case $sub in
+  ensure) cmd_ensure $name ;;
+  import) cmd_import $name ;;
+  ready) ready $name ;;
+  dir) cmd_dir $name ;;
+  env) (( $# == 1 )) || die "usage: $me env NAME electron-builder|tauri"; cmd_env $name $1 ;;
+  codesign) cmd_codesign $name "$@" ;;
+  *) die "unknown command '$sub'" ;;
+esac
