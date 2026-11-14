@@ -35,6 +35,9 @@
 #                                          gets CSC_KEYCHAIN and CSC_NAME
 #                                          (electron-builder), APPLE_SIGNING_IDENTITY
 #                                          (tauri) and MACOS_LOCAL_SIGNING_KEYCHAIN
+#   macos-local-signing resign NAME APP    re-sign APP in place, inside out, with this
+#                                          Mac's NAME: for an app built and signed on
+#                                          another Mac and copied here
 #
 # Prefer `run` to `env NAME electron-builder` for electron-builder. Given the
 # .p12, electron-builder (26.8.1) imports it into a keychain of its own and then
@@ -295,7 +298,41 @@ cmd_run() {
   with_keychain $name run_in_keychain $name "$@"
 }
 
-(( $# >= 2 )) || die "usage: $me ensure|import|ready|dir|env|codesign|run NAME [ARG...]"
+# Re-sign every piece of code in APP, deepest first, then APP itself: codesign
+# --deep signs nested code without its own entitlements, which breaks Electron
+# helpers. Keeps each piece's identifier, entitlements, flags and hardened
+# runtime, but not its designated requirement: that names the certificate it
+# was signed with, and keeping it would pin privacy grants to the other Mac's.
+resign_in_keychain() {
+  local name=$1 app=$2 f out
+  local -a sign=(/usr/bin/codesign --force --keychain $kc --sign $name --timestamp=none
+    --preserve-metadata=identifier,entitlements,flags,runtime)
+  local -a code=()
+  for f in "${(@f)$(find $app -type f \( -perm -u+x -o -name '*.dylib' -o -name '*.node' -o -name '*.so' \) -print)}"; do
+    [[ -n $f && $(file -b $f) == Mach-O* ]] && code+=($f)
+  done
+  code+=("${(@f)$(find $app -mindepth 1 -type d \( -name '*.app' -o -name '*.framework' -o -name '*.xpc' \
+    -o -name '*.appex' -o -name '*.bundle' -o -name '*.plugin' \) -print)}")
+  code=(${code:#})
+  # A nested path is always longer than its container's, so longest first is
+  # inside out.
+  (( $#code )) && for f in "${(@f)$(print -rl -- $code | awk '{ print length($0) "\t" $0 }' | sort -rn | cut -f2-)}"; do
+    out=$($sign $f 2>&1) || die "codesign failed on $f: $out"
+  done
+  out=$($sign $app 2>&1) || die "codesign failed on $app: $out"
+  /usr/bin/codesign --verify --deep --strict $app
+  say "re-signed $(( $#code + 1 )) pieces of code in ${app:t} as '$name'"
+}
+
+cmd_resign() {
+  local name=$1
+  shift
+  (( $# == 1 )) || die "usage: $me resign NAME APP"
+  [[ -d $1 ]] || die "no such bundle: $1"
+  with_keychain $name resign_in_keychain $name ${1:A}
+}
+
+(( $# >= 2 )) || die "usage: $me ensure|import|ready|dir|env|codesign|run|resign NAME [ARG...]"
 sub=$1 name=$2
 shift 2
 [[ -n $name ]] || die "the identity name is empty"
@@ -307,5 +344,6 @@ case $sub in
   env) (( $# == 1 )) || die "usage: $me env NAME electron-builder|tauri"; cmd_env $name $1 ;;
   codesign) cmd_codesign $name "$@" ;;
   run) cmd_run $name "$@" ;;
+  resign) cmd_resign $name "$@" ;;
   *) die "unknown command '$sub'" ;;
 esac

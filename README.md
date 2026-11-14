@@ -74,6 +74,38 @@ password belongs. macOS 14 does not check it there; macOS 27 does, and the
 build stops with `SecKeychainUnlock: The user name or passphrase you entered
 is not correct`. `run` avoids the step entirely.
 
+### Build once, sign on each Mac
+
+Each Mac has its own identity, and an app built on one Mac carries that Mac's
+certificate. To use it on another Mac without rebuilding there, copy it and
+re-sign it with the second Mac's identity:
+
+```sh
+# on the build Mac: build and sign as usual, then
+ditto -c -k --keepParent dist/My.app /tmp/My.zip && scp /tmp/My.zip other-mac:/tmp/
+# on the other Mac
+ditto -x -k /tmp/My.zip /tmp/stage/
+xattr -dr com.apple.quarantine /tmp/stage/My.app   # only if it was downloaded
+macos-local-signing resign "My App Local Signing" /tmp/stage/My.app
+# then swap it into /Applications
+```
+
+`resign` signs every nested piece of code first (dylibs, `.node` modules,
+helper apps, frameworks), deepest first, then the app, and verifies the result
+with `codesign --verify --deep --strict`. Each piece keeps its identifier,
+entitlements, flags and hardened runtime from the original signature. It does
+not keep the designated requirement: that names the build Mac's certificate,
+and keeping it would tie privacy grants to the wrong Mac. So the result has
+exactly the requirement a local build would have, and the app keeps the
+permissions you granted either way. Re-signing a 500 MB Electron app takes
+seconds. Do not use `codesign --deep --force` for this: it signs nested code
+without each piece's own entitlements, which breaks Electron helpers.
+
+Use this when the build is slow or the second Mac lacks the toolchain. Building
+on each Mac keeps the Macs independent: copying makes the second Mac wait for
+the first to be awake and finished. Like `run` and `codesign`, `resign` works
+over ssh; it never touches the login keychain.
+
 `macos-local-signing ready NAME` exits 0 when the identity is usable, for
 build scripts that fall back to ad hoc without it. `dir NAME` prints where
 it is kept: `~/.local/state/macos-local-signing/<name>/` (`identity.p12`,
