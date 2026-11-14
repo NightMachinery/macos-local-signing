@@ -47,18 +47,32 @@ If an identity of that name is already in your login keychain (made the
 old way), `ensure` moves it into the file store instead of making a new one,
 so the permissions your app already holds stay. `import NAME` does only that.
 
-Then sign in one of three ways:
+Then sign in one of these ways:
 
 ```sh
 # codesign directly
 macos-local-signing codesign "My App Local Signing" --force --deep My.app
 
-# electron-builder (CSC_LINK, CSC_KEY_PASSWORD, CSC_NAME)
-eval "$(macos-local-signing env "My App Local Signing" electron-builder)"
+# electron-builder: run the build with the identity in a throwaway keychain
+# (it gets CSC_KEYCHAIN and CSC_NAME, and no CSC_LINK)
+macos-local-signing run "My App Local Signing" npx electron-builder --mac
 
 # Tauri (APPLE_CERTIFICATE, APPLE_CERTIFICATE_PASSWORD, APPLE_SIGNING_IDENTITY)
 eval "$(macos-local-signing env "My App Local Signing" tauri)"
 ```
+
+`run NAME CMD...` imports the identity into a keychain only that run knows the
+password of, puts it on the keychain search list, runs the command, and
+removes it again, returning the command's exit status. The command also gets
+`APPLE_SIGNING_IDENTITY` and `MACOS_LOCAL_SIGNING_KEYCHAIN`, for other tools.
+
+`env NAME electron-builder` (exports `CSC_LINK`, `CSC_KEY_PASSWORD`, `CSC_NAME`)
+still exists but fails on recent macOS. Given the `.p12`, electron-builder
+(seen with 26.8.1) imports it into a keychain of its own and then passes the
+`.p12` password to `security set-key-partition-list -k`, where that keychain's
+password belongs. macOS 14 does not check it there; macOS 27 does, and the
+build stops with `SecKeychainUnlock: The user name or passphrase you entered
+is not correct`. `run` avoids the step entirely.
 
 `macos-local-signing ready NAME` exits 0 when the identity is usable, for
 build scripts that fall back to ad hoc without it. `dir NAME` prints where

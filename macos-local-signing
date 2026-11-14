@@ -30,6 +30,19 @@
 #   macos-local-signing codesign NAME ARG...
 #                                          run codesign --sign NAME ARG... from a
 #                                          throwaway keychain
+#   macos-local-signing run NAME CMD...    run a build command with the identity in a
+#                                          throwaway keychain on the search list; it
+#                                          gets CSC_KEYCHAIN and CSC_NAME
+#                                          (electron-builder), APPLE_SIGNING_IDENTITY
+#                                          (tauri) and MACOS_LOCAL_SIGNING_KEYCHAIN
+#
+# Prefer `run` to `env NAME electron-builder` for electron-builder. Given the
+# .p12, electron-builder (26.8.1) imports it into a keychain of its own and then
+# passes the .p12 password to `security set-key-partition-list -k`, which wants
+# that keychain's password. macOS 14 does not check it there; macOS 27 does,
+# so the build fails with "SecKeychainUnlock: The user name or passphrase you
+# entered is not correct". With `run`, electron-builder gets a keychain that is
+# ready and never makes one.
 #
 # The store is $MACOS_LOCAL_SIGNING_HOME (default ~/.local/state/macos-local-signing),
 # one directory per identity, readable only by you.
@@ -37,6 +50,8 @@ emulate -L zsh
 setopt err_exit no_unset pipe_fail extended_glob
 # Only macOS's own tools: a GNU or other base64, awk or openssl earlier on the
 # caller's PATH takes different options or writes formats `security` rejects.
+# `run` gives its command the caller's PATH back.
+caller_path=$PATH
 path=(/usr/bin /bin /usr/sbin /sbin)
 
 store=${MACOS_LOCAL_SIGNING_HOME:-$HOME/.local/state/macos-local-signing}
@@ -221,8 +236,10 @@ search_list_remove() {
   $security list-keychains -d user -s "${keep[@]}" 2>/dev/null || true
 }
 
-cmd_codesign() {
-  local name=$1 d work kc kpw
+# Import NAME into a throwaway keychain, put that on the search list, run
+# CMD... with $kc naming it, then remove it whatever CMD did. Returns CMD's status.
+with_keychain() {
+  local name=$1 d work kc kpw rc=0
   shift
   d=$(cmd_dir $name)
   # Resolved (/var is a symlink to /private/var), to match the search list.
@@ -240,15 +257,45 @@ cmd_codesign() {
     # codesign finds identities only in keychains on the search list, even
     # with --keychain, so add ours for the duration of the run.
     search_list_add $kc
-    /usr/bin/codesign --keychain $kc --sign $name "$@"
+    "$@" || rc=$?
   } always {
     search_list_remove $kc
     $security delete-keychain $kc 2>/dev/null || true
     rm -rf $work
   }
+  return $rc
 }
 
-(( $# >= 2 )) || die "usage: $me ensure|import|ready|dir|env|codesign NAME [ARG...]"
+sign_in_keychain() {
+  local name=$1
+  shift
+  /usr/bin/codesign --keychain $kc --sign $name "$@"
+}
+
+cmd_codesign() {
+  local name=$1
+  shift
+  with_keychain $name sign_in_keychain $name "$@"
+}
+
+# Unset CSC_LINK so electron-builder signs from our keychain instead of
+# importing the .p12 into one of its own (see `run` in the usage).
+run_in_keychain() {
+  local name=$1
+  shift
+  /usr/bin/env -u CSC_LINK -u CSC_KEY_PASSWORD PATH=$caller_path \
+    CSC_KEYCHAIN=$kc CSC_NAME=$name APPLE_SIGNING_IDENTITY=$name \
+    MACOS_LOCAL_SIGNING_KEYCHAIN=$kc "$@"
+}
+
+cmd_run() {
+  local name=$1
+  shift
+  (( $# )) || die "usage: $me run NAME CMD..."
+  with_keychain $name run_in_keychain $name "$@"
+}
+
+(( $# >= 2 )) || die "usage: $me ensure|import|ready|dir|env|codesign|run NAME [ARG...]"
 sub=$1 name=$2
 shift 2
 [[ -n $name ]] || die "the identity name is empty"
@@ -259,5 +306,6 @@ case $sub in
   dir) cmd_dir $name ;;
   env) (( $# == 1 )) || die "usage: $me env NAME electron-builder|tauri"; cmd_env $name $1 ;;
   codesign) cmd_codesign $name "$@" ;;
+  run) cmd_run $name "$@" ;;
   *) die "unknown command '$sub'" ;;
 esac
